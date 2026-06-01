@@ -1,0 +1,231 @@
+#!/bin/sh
+# offload —— 把占空间的目录安全迁移到外接盘，并带断连保护。
+#
+# 设计要点：
+#   * 归档类目录用 rsync 迁移到外接盘，校验通过后把原目录改名为 .offload_old 备份，
+#     再在原位置建软链接指向外接盘。确认无误后用 `offload commit` 删除备份。
+#   * 靠外接盘上的哨兵文件判断盘是否真的在线（盘断开时整个挂载点会消失）。
+#   * 软链接在盘断开时只会“悬空”，访问报 No such file，不会导致系统崩溃。
+#
+# 用法见 `offload help`。
+
+set -eu
+
+EXT_ROOT="${OFFLOAD_EXT_ROOT:-/Volumes/Data-External/Offload}"
+SENTINEL="$EXT_ROOT/.online"
+ARCHIVE_DIR="$EXT_ROOT/archive"
+STATE_DIR="$HOME/.config/offload"
+LINKS="$STATE_DIR/links.tsv"   # 每行: 链接路径<TAB>外接盘目标
+
+mkdir -p "$STATE_DIR"
+[ -f "$LINKS" ] || : > "$LINKS"
+
+c_red()   { printf '\033[31m%s\033[0m' "$1"; }
+c_green() { printf '\033[32m%s\033[0m' "$1"; }
+c_yel()   { printf '\033[33m%s\033[0m' "$1"; }
+
+die() { printf '%s %s\n' "$(c_red '[offload]')" "$1" >&2; exit 1; }
+info(){ printf '%s %s\n' "$(c_green '[offload]')" "$1"; }
+warn(){ printf '%s %s\n' "$(c_yel '[offload]')" "$1"; }
+
+# 外接盘是否在线
+is_online() { [ -f "$SENTINEL" ]; }
+
+require_online() {
+  is_online || die "外接盘未挂载（找不到哨兵 $SENTINEL）。请插上盘后重试。"
+}
+
+usage() {
+  cat <<'EOF'
+offload —— 把占空间的目录安全迁移到外接盘（带断连保护）
+
+命令:
+  offload check                外接盘是否在线（退出码 0=在线 1=离线）
+  offload move <目录>          迁移目录到外接盘并建软链接（原目录改名备份，不立即删）
+  offload commit <目录|all>    删除迁移后保留的 .offload_old 备份（确认无误后执行）
+  offload rollback <目录>      回滚：删软链接、从外接盘移回原位置（或恢复备份）
+  offload status               列出所有迁移的软链接及其健康状态
+  offload doctor               检查悬空/异常软链接并给出建议
+  offload help                 显示本帮助
+
+示例:
+  offload move ~/Downloads
+  offload status
+  offload commit ~/Downloads
+EOF
+}
+
+# 把绝对路径里的 $HOME 还原显示
+short() { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}";; *) printf '%s' "$1";; esac; }
+
+cmd_check() {
+  if is_online; then info "外接盘在线: $EXT_ROOT"; return 0
+  else warn "外接盘离线"; return 1; fi
+}
+
+cmd_move() {
+  [ $# -ge 1 ] || die "用法: offload move <目录>"
+  require_online
+  mkdir -p "$ARCHIVE_DIR"
+
+  src="$1"
+  # 规范化为绝对路径
+  case "$src" in /*) : ;; *) src="$PWD/$src";; esac
+  src="${src%/}"
+
+  [ -e "$src" ] || die "源不存在: $src"
+  [ -d "$src" ] || die "只支持迁移目录: $src"
+  [ -L "$src" ] && die "源已经是软链接，可能已迁移过: $src"
+
+  base="$(basename "$src")"
+  dest="$ARCHIVE_DIR/$base"
+  [ -e "$dest" ] && die "外接盘目标已存在，请改名或先清理: $dest"
+
+  sz="$(du -sh "$src" 2>/dev/null | cut -f1)"
+  info "迁移 $(short "$src")  (大小 $sz)  →  $dest"
+
+  # 用 macOS 原生 ditto 拷贝：完整保留资源分支/扩展属性/ACL，比旧版 rsync 可靠。
+  info "第 1 步：ditto 拷贝到外接盘（大目录请耐心等待）..."
+  if ! ditto "$src" "$dest"; then
+    warn "拷贝失败，已删除外接盘上的不完整副本，原目录原封未动。"
+    rm -rf "$dest"
+    die "中止：拷贝未成功。"
+  fi
+
+  info "第 2 步：校验文件数与字节数..."
+  src_files=$(find "$src" -type f 2>/dev/null | wc -l | tr -d ' ')
+  dst_files=$(find "$dest" -type f 2>/dev/null | wc -l | tr -d ' ')
+  src_kb=$(du -sk "$src" 2>/dev/null | cut -f1)
+  dst_kb=$(du -sk "$dest" 2>/dev/null | cut -f1)
+  info "  源: $src_files 文件 / ${src_kb}KB   目标: $dst_files 文件 / ${dst_kb}KB"
+  if [ "$src_files" != "$dst_files" ]; then
+    warn "文件数不一致，保留原目录，删除外接盘副本。"
+    rm -rf "$dest"
+    die "中止：校验未通过（文件数不符）。"
+  fi
+  # 字节数容差 2%（APFS 块对齐可能有细微差）
+  if [ "$src_kb" -gt 0 ]; then
+    diff_kb=$(( src_kb > dst_kb ? src_kb - dst_kb : dst_kb - src_kb ))
+    if [ $(( diff_kb * 100 / src_kb )) -gt 2 ]; then
+      warn "字节数差异超过 2%，保留原目录，删除外接盘副本。"
+      rm -rf "$dest"
+      die "中止：校验未通过（字节数差异过大）。"
+    fi
+  fi
+  info "校验通过 ✓"
+
+  bak="$src.offload_old"
+  [ -e "$bak" ] && die "备份名已被占用: $bak（请先处理）"
+  info "第 3 步：原目录改名备份 → $(short "$bak")"
+  mv "$src" "$bak"
+
+  info "第 4 步：建立软链接 $(short "$src") → $dest"
+  ln -s "$dest" "$src"
+
+  # 记录
+  printf '%s\t%s\n' "$src" "$dest" >> "$LINKS"
+
+  info "完成 ✓  原数据备份仍在 $(short "$bak")"
+  warn "确认应用/数据正常后，执行: offload commit $(short "$src")  以删除备份释放空间"
+}
+
+cmd_commit() {
+  [ $# -ge 1 ] || die "用法: offload commit <目录|all>"
+  if [ "$1" = "all" ]; then
+    while IFS="$(printf '\t')" read -r link dest; do
+      [ -n "$link" ] || continue
+      bak="$link.offload_old"
+      if [ -e "$bak" ]; then info "删除备份 $(short "$bak")"; rm -rf "$bak"; fi
+    done < "$LINKS"
+    info "全部备份已清理。"
+    return 0
+  fi
+  src="$1"; case "$src" in /*) : ;; *) src="$PWD/$src";; esac; src="${src%/}"
+  bak="$src.offload_old"
+  [ -e "$bak" ] || die "找不到备份: $bak"
+  info "删除备份 $(short "$bak")"
+  rm -rf "$bak"
+  info "已释放空间。"
+}
+
+cmd_rollback() {
+  [ $# -ge 1 ] || die "用法: offload rollback <目录>"
+  src="$1"; case "$src" in /*) : ;; *) src="$PWD/$src";; esac; src="${src%/}"
+  bak="$src.offload_old"
+
+  if [ -L "$src" ]; then
+    dest="$(readlink "$src")"
+    info "移除软链接 $(short "$src")"
+    rm "$src"
+    if [ -e "$bak" ]; then
+      info "从备份恢复原目录"
+      mv "$bak" "$src"
+    elif is_online && [ -e "$dest" ]; then
+      info "备份不存在，从外接盘移回数据（需要本地有足够空间）"
+      ditto "$dest" "$src" && rm -rf "$dest"
+    else
+      die "无备份且外接盘离线，无法恢复。请插上盘后重试。"
+    fi
+  elif [ -e "$bak" ]; then
+    warn "原位置不是软链接，直接用备份覆盖恢复"
+    [ -e "$src" ] && rm -rf "$src"
+    mv "$bak" "$src"
+  else
+    die "无可回滚的状态: $(short "$src")"
+  fi
+
+  # 从清单移除（用 awk 按 TAB 精确比对首字段，避免路径中的正则元字符/空格误匹配）
+  tmp="$LINKS.tmp.$$"
+  awk -F '\t' -v s="$src" '$1 != s' "$LINKS" > "$tmp" 2>/dev/null || : > "$tmp"
+  mv "$tmp" "$LINKS"
+  info "回滚完成 ✓"
+}
+
+cmd_status() {
+  if is_online; then info "外接盘: 在线"; else warn "外接盘: 离线（软链接会悬空，属正常，插回即恢复）"; fi
+  printf '\n%-40s %-10s %s\n' "本地软链接" "状态" "外接盘目标"
+  printf '%s\n' "--------------------------------------------------------------------------------"
+  [ -s "$LINKS" ] || { echo "(暂无迁移记录)"; return 0; }
+  while IFS="$(printf '\t')" read -r link dest; do
+    [ -n "$link" ] || continue
+    if [ -L "$link" ]; then
+      if [ -e "$link" ]; then st="$(c_green OK)"
+      else st="$(c_yel 悬空)"; fi
+    elif [ -e "$link" ]; then st="$(c_red '非链接')"
+    else st="$(c_red 缺失)"; fi
+    bak=""; [ -e "$link.offload_old" ] && bak="  [有备份未commit]"
+    printf '%-40s %-10b %s%s\n' "$(short "$link")" "$st" "$dest" "$bak"
+  done < "$LINKS"
+}
+
+cmd_doctor() {
+  problems=0
+  if ! is_online; then
+    warn "外接盘当前离线 —— 以下“悬空”是正常现象，插回盘即恢复，无需处理。"
+  fi
+  while IFS="$(printf '\t')" read -r link dest; do
+    [ -n "$link" ] || continue
+    if [ ! -L "$link" ] && [ ! -e "$link" ]; then
+      warn "链接丢失: $(short "$link") （记录存在但本地已无此路径）"; problems=$((problems+1))
+    elif [ -L "$link" ] && is_online && [ ! -e "$link" ]; then
+      warn "盘在线但目标缺失: $(short "$link") → $dest"; problems=$((problems+1))
+    fi
+  done < "$LINKS"
+  [ "$problems" -eq 0 ] && info "未发现需要处理的问题 ✓"
+}
+
+main() {
+  [ $# -ge 1 ] || { usage; exit 0; }
+  cmd="$1"; shift
+  case "$cmd" in
+    check)    cmd_check "$@";;
+    move)     cmd_move "$@";;
+    commit)   cmd_commit "$@";;
+    rollback) cmd_rollback "$@";;
+    status)   cmd_status "$@";;
+    doctor)   cmd_doctor "$@";;
+    help|-h|--help) usage;;
+    *) die "未知命令: $cmd（看 offload help）";;
+  esac
+}
+main "$@"

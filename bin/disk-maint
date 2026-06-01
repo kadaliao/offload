@@ -1,0 +1,49 @@
+#!/bin/sh
+# disk-maint —— 定期磁盘维护：清理可再生缓存 + 报告磁盘/迁移状态。
+#
+# 默认只“预览”各项缓存大小、不删任何东西（dry-run）。
+# 加 --yes（或 -y）才真正执行清理。
+#
+#   disk-maint          # 预览：列出可清理项及大小、磁盘空间、offload 状态
+#   disk-maint --yes    # 执行清理
+
+set -eu
+
+YES=0
+case "${1:-}" in -y|--yes) YES=1;; "") : ;; *) echo "用法: disk-maint [--yes]"; exit 1;; esac
+
+c_g(){ printf '\033[32m%s\033[0m' "$1"; }
+c_y(){ printf '\033[33m%s\033[0m' "$1"; }
+hdr(){ printf '\n%s\n' "$(c_g "== $1 ==")"; }
+
+avail(){ df -h / | tail -1 | awk '{print $4}'; }
+sizeof(){ du -sh "$1" 2>/dev/null | cut -f1 || echo "-"; }
+
+hdr "磁盘空间"
+df -h / | awk 'NR==1 || /\/$/'
+
+hdr "可清理的可再生缓存（删后会按需自动重建）"
+printf '%-34s %s\n' "Homebrew 缓存" "$(brew --cache 2>/dev/null >/dev/null && du -sh "$(brew --cache)" 2>/dev/null | cut -f1 || echo -)"
+printf '%-34s %s\n' "Xcode DerivedData" "$(sizeof "$HOME/Library/Developer/Xcode/DerivedData")"
+printf '%-34s %s\n' "系统级模拟器缓存(需sudo)" "$(sizeof /Library/Developer/CoreSimulator/Caches)"
+printf '%-34s %s\n' "go build 缓存" "$(sizeof "$(go env GOCACHE 2>/dev/null || echo /nonexist)")"
+printf '%-34s %s\n' "pip 缓存" "$(sizeof "$HOME/Library/Caches/pip")"
+
+if [ "$YES" -eq 0 ]; then
+  printf '\n%s 这是预览。确认无误后运行 %s 真正清理。\n' "$(c_y '[dry-run]')" "$(c_g 'disk-maint --yes')"
+  printf '提示：系统级模拟器缓存需单独手动跑（要密码）：\n  sudo rm -rf /Library/Developer/CoreSimulator/Caches/*\n'
+else
+  hdr "执行清理"
+  echo "- Homebrew cleanup..."; brew cleanup -s --prune=all >/dev/null 2>&1 && echo "  done" || echo "  skip"
+  echo "- Xcode DerivedData..."; rm -rf "$HOME/Library/Developer/Xcode/DerivedData"/* 2>/dev/null; echo "  done"
+  echo "- go build 缓存..."; go clean -cache >/dev/null 2>&1 && echo "  done" || echo "  skip"
+  echo "- pip 缓存..."; rm -rf "$HOME/Library/Caches/pip" 2>/dev/null; echo "  done"
+  echo "- 无效模拟器..."; xcrun simctl delete unavailable >/dev/null 2>&1 && echo "  done" || echo "  skip"
+  printf '\n%s 清理完成。系统级模拟器缓存(3.8G)需手动跑：sudo rm -rf /Library/Developer/CoreSimulator/Caches/*\n' "$(c_g '[ok]')"
+fi
+
+hdr "迁移(offload)状态"
+if command -v offload >/dev/null 2>&1; then offload status; else echo "(offload 未安装)"; fi
+
+hdr "完成"
+printf '当前可用空间: %s\n' "$(c_g "$(avail)")"
