@@ -2,10 +2,10 @@
 # offload —— 把占空间的目录安全迁移到外接盘，并带断连保护。
 #
 # 设计要点：
-#   * 归档类目录用 rsync 迁移到外接盘，校验通过后把原目录改名为 .offload_old 备份，
+#   * 归档类目录用 ditto 拷贝到外接盘，校验通过后把原目录改名为 .offload_old 备份，
 #     再在原位置建软链接指向外接盘。确认无误后用 `offload commit` 删除备份。
 #   * 靠外接盘上的哨兵文件判断盘是否真的在线（盘断开时整个挂载点会消失）。
-#   * 软链接在盘断开时只会“悬空”，访问报 No such file，不会导致系统崩溃。
+#   * 软链接在盘断开时只会「悬空」，访问报 No such file，不会导致系统崩溃。
 #
 # 用法见 `offload help`。
 
@@ -14,7 +14,7 @@ set -eu
 EXT_ROOT="${OFFLOAD_EXT_ROOT:-/Volumes/Data-External/Offload}"
 SENTINEL="$EXT_ROOT/.online"
 ARCHIVE_DIR="$EXT_ROOT/archive"
-STATE_DIR="$HOME/.config/offload"
+STATE_DIR="${OFFLOAD_STATE_DIR:-$HOME/.config/offload}"
 LINKS="$STATE_DIR/links.tsv"   # 每行: 链接路径<TAB>外接盘目标
 
 mkdir -p "$STATE_DIR"
@@ -201,7 +201,7 @@ cmd_status() {
 cmd_doctor() {
   problems=0
   if ! is_online; then
-    warn "外接盘当前离线 —— 以下“悬空”是正常现象，插回盘即恢复，无需处理。"
+    warn "外接盘当前离线 —— 以下「悬空」是正常现象，插回盘即恢复，无需处理。"
   fi
   while IFS="$(printf '\t')" read -r link dest; do
     [ -n "$link" ] || continue

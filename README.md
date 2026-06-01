@@ -1,5 +1,7 @@
 # offload
 
+[![CI](https://github.com/kadaliao/offload/actions/workflows/ci.yml/badge.svg)](https://github.com/kadaliao/offload/actions/workflows/ci.yml)
+
 把占空间的目录安全迁移到外接盘，并带**断连保护**——外接盘拔掉也不会让系统崩溃。
 
 为系统盘吃紧的 Mac 设计（典型场景：256G 系统盘 + 大容量外接盘）。
@@ -60,6 +62,15 @@ disk-maint --yes    # 真正执行清理
 
 - 迁移不可再生数据务必走 `offload move`（有备份），不要手写 `rm` 绕过。
 - 本工具在 macOS（APFS 外接盘）上开发测试。脚本为 POSIX sh，fish 片段仅用于 go 缓存条件变量。
+
+## 开发
+
+```bash
+sh test/run.sh        # 跑测试套件（纯 POSIX sh，用临时目录隔离，不碰真实外接盘）
+shellcheck --severity=warning bin/offload bin/disk-maint install.sh test/run.sh
+```
+
+CI 在每次 push / PR 时运行 shellcheck（Ubuntu）和测试套件（macOS）。
 
 ## License
 

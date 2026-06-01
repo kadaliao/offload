@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    name: ShellCheck 静态检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck
+        # ubuntu runner 预装 shellcheck；只 fail on warning 及以上（info/style 不阻塞）
+        run: shellcheck --severity=warning bin/offload bin/disk-maint install.sh test/run.sh
+
+  test:
+    name: 测试套件 (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests
+        # 脚本依赖 macOS 原生 ditto，故在 macOS runner 上运行
+        run: sh test/run.sh
